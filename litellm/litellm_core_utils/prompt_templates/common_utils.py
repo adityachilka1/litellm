@@ -815,7 +815,26 @@ def extract_file_data(file_data: FileTypes) -> ExtractedFileData:
 # ---------------------------------------------------------------------------
 
 
-def unpack_defs(schema: dict, defs: dict) -> None:
+def _count_nodes(obj: Any) -> int:
+    """Count dict / list / scalar nodes iteratively (no recursion stack risk)."""
+    count = 0
+    stack: list = [obj]
+    while stack:
+        x = stack.pop()
+        count += 1
+        if isinstance(x, dict):
+            stack.extend(x.values())
+        elif isinstance(x, list):
+            stack.extend(x)
+    return count
+
+
+def unpack_defs(
+    schema: dict,
+    defs: dict,
+    max_refs: Optional[int] = None,
+    max_inlined_nodes: Optional[int] = None,
+) -> None:
     """Expand *all* ``$ref`` entries pointing into ``$defs`` / ``definitions``.
 
     This utility walks the entire schema tree (dicts and lists) so it naturally
@@ -825,6 +844,23 @@ def unpack_defs(schema: dict, defs: dict) -> None:
     It mutates *schema* in-place and does **not** return anything.  The helper
     keeps memory overhead low by resolving nodes as it encounters them rather
     than materialising a fully dereferenced copy first.
+
+    Two independent schema-bomb guards are available; both default to ``None``
+    (unbounded) so existing callers are unaffected:
+
+    * ``max_refs`` caps the **number** of ``$ref`` resolutions performed.
+      Cycle detection only stops a ref from being resolved a second time
+      *along the same path*; a fan-out schema where each definition references
+      the next one multiple times still expands exponentially without this
+      bound.
+    * ``max_inlined_nodes`` caps the **cumulative size** (counted in
+      dict / list / scalar nodes) of all targets that have been inlined. This
+      catches the complementary attack where a small input has many ``$ref``s
+      to a single large target, which ``max_refs`` alone does not bound.
+      Checked *before* each ``copy.deepcopy`` so an oversized expansion is
+      rejected without first materialising it.
+
+    Both raise ``ValueError`` on overflow.
     """
 
     import copy
@@ -844,6 +880,8 @@ def unpack_defs(schema: dict, defs: dict) -> None:
     queue: deque[
         tuple[Any, Union[dict, list, None], Union[str, int, None], dict, set]
     ] = deque([(schema, None, None, root_defs, set())])
+    refs_resolved = 0
+    inlined_nodes = 0
 
     while queue:
         node, parent, key, active_defs, ref_chain = queue.popleft()
@@ -863,6 +901,24 @@ def unpack_defs(schema: dict, defs: dict) -> None:
                 # Unknown reference – leave untouched
                 if target_schema is None:
                     continue
+
+                refs_resolved += 1
+                if max_refs is not None and refs_resolved > max_refs:
+                    raise ValueError(
+                        f"unpack_defs: $ref expansion exceeded the "
+                        f"{max_refs}-resolution budget. Refusing to inline "
+                        f"further to prevent schema-bomb resource exhaustion."
+                    )
+
+                if max_inlined_nodes is not None:
+                    inlined_nodes += _count_nodes(target_schema)
+                    if inlined_nodes > max_inlined_nodes:
+                        raise ValueError(
+                            f"unpack_defs: inlined schema exceeded the "
+                            f"{max_inlined_nodes}-node budget. Refusing to "
+                            f"deep-copy further to prevent schema-bomb "
+                            f"memory exhaustion."
+                        )
 
                 # Merge defs from the target to capture nested definitions
                 child_defs = {
@@ -909,6 +965,65 @@ def unpack_defs(schema: dict, defs: dict) -> None:
             # Add all list items to queue
             for idx, item in enumerate(node):
                 queue.append((item, node, idx, active_defs, ref_chain))
+
+
+def _has_legacy_defs(schema: object) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    components = schema.get("components")
+    return "definitions" in schema or (
+        isinstance(components, dict) and isinstance(components.get("schemas"), dict)
+    )
+
+
+# Schema-bomb budgets for ``unpack_legacy_defs``. Real-world MCP / OpenAPI-
+# derived tool schemas resolve at most a few hundred refs and inline a few
+# thousand nodes (Google APIs spec sits well under both limits); the defaults
+# are several orders of magnitude above that, so legitimate schemas never
+# trip them. They exist to bound request-supplied schemas where:
+#   * many definitions chain into each other (fan-out)        -> ``max_refs``
+#   * many refs each point to one large target (amplification) -> ``max_inlined_nodes``
+# both of which would otherwise force the proxy to deep-copy and forward
+# huge expanded objects before reaching the upstream provider.
+_LEGACY_DEFS_MAX_REFS = 10_000
+_LEGACY_DEFS_MAX_INLINED_NODES = 100_000
+
+
+def unpack_legacy_defs(
+    schema: dict,
+    *,
+    copy: bool = False,
+    max_refs: int = _LEGACY_DEFS_MAX_REFS,
+    max_inlined_nodes: int = _LEGACY_DEFS_MAX_INLINED_NODES,
+) -> dict:
+    """Inline ``$ref``s backed by draft-04 ``definitions`` / OpenAPI
+    ``components.schemas``. ``$defs`` is left untouched.
+
+    Anthropic and Fireworks tool-schema resolvers only recognise ``$defs``;
+    legacy / OpenAPI def blocks are otherwise silently dropped and leave
+    dangling pointers. See https://github.com/BerriAI/litellm/issues/26692.
+
+    Mutates ``schema`` in place and returns it. Pass ``copy=True`` to deep-copy
+    first (only when there is actually work to do). ``max_refs`` bounds the
+    number of ``$ref`` resolutions performed and ``max_inlined_nodes`` bounds
+    the cumulative size of inlined targets; either raises ``ValueError`` on
+    overflow so request-supplied schemas cannot expand into a schema-bomb
+    before reaching the upstream provider.
+    """
+    if not _has_legacy_defs(schema):
+        return schema
+    if copy:
+        import copy as _copy
+
+        schema = _copy.deepcopy(schema)
+    # On key collision, ``definitions`` wins over ``components.schemas`` --
+    # ``unpack_defs`` keys refs by last path segment so a single name can only
+    # resolve to one body, and ``definitions`` is the JSON-Schema-native
+    # namespace.
+    defs = schema.pop("components", {}).get("schemas") or {}
+    defs.update(schema.pop("definitions", None) or {})
+    unpack_defs(schema, defs, max_refs=max_refs, max_inlined_nodes=max_inlined_nodes)
+    return schema
 
 
 def _get_image_mime_type_from_url(url: str) -> Optional[str]:
